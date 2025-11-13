@@ -1,0 +1,233 @@
+defancive_mac_check_Tool  
+
+#!/usr/bin/env python3
+"""
+defensive_mac_check_improved.py
+- Scans a CIDR subnet by ARP to collect IP/MAC pairs (requires scapy).
+- Optionally polls switches via SNMP to get CAM/FDB entries for port correlation (requires pysnmp).
+- Optionally uses manuf to enrich MAC -> vendor (pip install manuf).
+- Reports duplicate MAC addresses (same MAC seen answering at multiple IPs).
+- Can run once or continuously (interval).
+"""
+
+import argparse
+import json
+import logging
+import time
+import sys
+from collections import defaultdict
+
+# scapy imports
+from scapy.all import ARP, Ether, srp, conf
+
+# optional imports
+try:
+    from manuf import manuf
+    MANUF_AVAILABLE = True
+except Exception:
+    MANUF_AVAILABLE = False
+
+# optional SNMP imports (pysnmp)
+try:
+    from pysnmp.hlapi import (
+        SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
+        ObjectType, ObjectIdentity, nextCmd
+    )
+    PYSNMP_AVAILABLE = True
+except Exception:
+    PYSNMP_AVAILABLE = False
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
+logger = logging.getLogger("mac-check")
+
+def arp_scan(net="192.168.1.0/24", timeout=2):
+    """Perform a simple ARP scan and return list of (ip, mac)."""
+    conf.verb = 0
+    logger.debug("Sending ARP requests to %s", net)
+    pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=net)
+    ans, _ = srp(pkt, timeout=timeout)
+    results = []
+    for snd, rcv in ans:
+        ip = rcv.psrc
+        mac = rcv.hwsrc.lower()
+        results.append((ip, mac))
+    logger.debug("ARP scan found %d hosts", len(results))
+    return results
+
+def find_duplicates(entries):
+    ip_by_mac = defaultdict(list)
+    for ip, mac in entries:
+        ip_by_mac[mac].append(ip)
+    duplicates = {mac: ips for mac, ips in ip_by_mac.items() if len(ips) > 1}
+    return duplicates
+
+def vendor_lookup_init():
+    """Return a manuf.MacParser if available, else None."""
+    if not MANUF_AVAILABLE:
+        logger.debug("manuf not available for OUI lookup")
+        return None
+    parser = manuf.MacParser()
+    return parser
+
+def enrich_with_vendor(entries, parser):
+    if parser is None:
+        return {mac: {"ips": ips} for mac, ips in entries.items()}
+    enriched = {}
+    for mac, ips in entries.items():
+        vendor = parser.get_manuf(mac) or "Unknown"
+        enriched[mac] = {"ips": ips, "vendor": vendor}
+    return enriched
+
+# --- Optional: SNMP CAM/FDB polling (very basic) ---
+def snmp_walk_fdb(switch_ip, community="public", port=161, timeout=1):
+    """
+    Walk the BRIDGE-MIB dot1dTpFdbTable.
+    Returns a dict mac -> list of bridgePort numbers (integers).
+    NOTE: mapping from bridgePort -> ifIndex requires fetching dot1dBasePortIfIndex.
+    This function returns raw bridge port numbers for later mapping.
+    """
+    if not PYSNMP_AVAILABLE:
+        raise RuntimeError("pysnmp required for SNMP functions (pip install pysnmp)")
+
+    # dot1dTpFdbAddress OID: 1.3.6.1.2.1.17.4.3.1.1
+    # dot1dTpFdbPort    OID: 1.3.6.1.2.1.17.4.3.1.2
+    fdb_oid = "1.3.6.1.2.1.17.4.3.1"  # base
+
+    mac_to_ports = defaultdict(list)
+    logger.info("Polling switch %s via SNMP (community=%s)...", switch_ip, community)
+    for (errorIndication,
+         errorStatus,
+         errorIndex,
+         varBinds) in nextCmd(
+            SnmpEngine(),
+            CommunityData(community, mpModel=1),  # v2c
+            UdpTransportTarget((switch_ip, port), timeout=timeout, retries=0),
+            ContextData(),
+            ObjectType(ObjectIdentity(fdb_oid)),
+            lexicographicMode=False
+    ):
+        if errorIndication:
+            logger.error("SNMP error: %s", errorIndication)
+            break
+        elif errorStatus:
+            logger.error('%s at %s', errorStatus.prettyPrint(),
+                         errorIndex and varBinds[int(errorIndex) - 1][0] or '?')
+            break
+        else:
+            # varBinds is a list of (ObjectName, ObjectValue) tuples
+            for name, val in varBinds:
+                oid_str = name.prettyPrint()
+                val_str = val.prettyPrint()
+                # example OID for dot1dTpFdbPort: ...1.3.6.1.2.1.17.4.3.1.2.<mac-as-octets>
+                # Another approach is to parse MAC from oid suffix; pysnmp returns ASN1 OCTET STRING for MAC keys.
+                # We'll attempt a safe parse:
+                try:
+                    # If val is int -> port, and last part of oid contains mac bytes
+                    port_num = int(val_str)
+                    # Get the trailing bytes of the oid as MAC (if present)
+                    parts = oid_str.split('.')
+                    # heuristic: last 6 numbers are MAC bytes (0-255)
+                    if len(parts) >= 6:
+                        tail = parts[-6:]
+                        mac = ':'.join(f"{int(x):02x}" for x in tail)
+                        mac_to_ports[mac].append(port_num)
+                except Exception:
+                    continue
+    return dict(mac_to_ports)
+
+# --- Main runner ---
+def run_once(args, vendor_parser):
+    entries = arp_scan(net=args.net, timeout=args.timeout)
+    duplicates = find_duplicates(entries)
+    # Format output
+    results = {"scan_net": args.net, "timestamp": time.time(), "total_hosts": len(entries)}
+    if args.enrich and MANUF_AVAILABLE:
+        ip_by_mac = defaultdict(list)
+        for ip, mac in entries:
+            ip_by_mac[mac].append(ip)
+        enriched = enrich_with_vendor(ip_by_mac, vendor_parser)
+        results["duplicates"] = enriched if enriched else {}
+    else:
+        ip_by_mac = defaultdict(list)
+        for ip, mac in entries:
+            ip_by_mac[mac].append(ip)
+        results["duplicates"] = {mac: ips for mac, ips in ip_by_mac.items() if len(ips) > 1}
+
+    # optionally poll SNMP switch(s)
+    if args.snmp_switch:
+        snmp_info = {}
+        for switch in args.snmp_switch:
+            try:
+                mac_to_ports = snmp_walk_fdb(switch, community=args.snmp_community, timeout=args.snmp_timeout)
+                snmp_info[switch] = mac_to_ports
+            except Exception as e:
+                logger.warning("SNMP poll failed for %s: %s", switch, e)
+        results["snmp_fdb"] = snmp_info
+
+    # print formatted alerts for duplicates
+    if results["duplicates"]:
+        logger.warning("Duplicate MAC addresses detected:")
+        for mac, info in results["duplicates"].items():
+            if isinstance(info, dict):
+                ips = info.get("ips", [])
+                vendor = info.get("vendor")
+                logger.warning("  MAC %s seen at IPs: %s  Vendor: %s", mac, ', '.join(ips), vendor)
+            else:
+                logger.warning("  MAC %s seen at IPs: %s", mac, ', '.join(info))
+    else:
+        logger.info("No duplicate MACs found.")
+
+    # Write output JSON file if requested
+    if args.output:
+        with open(args.output, "a") as fh:
+            fh.write(json.dumps(results) + "\n")
+
+    return results
+
+def main():
+    parser = argparse.ArgumentParser(description="Defensive MAC duplicate detector (ARP + optional SNMP enrichment)")
+    parser.add_argument("net", nargs="?", default="192.168.1.0/24", help="CIDR subnet to scan (default: 192.168.1.0/24)")
+    parser.add_argument("--interval", type=int, default=0, help="If >0, run continuously every N seconds")
+    parser.add_argument("--timeout", type=int, default=2, help="ARP timeout seconds")
+    parser.add_argument("--enrich", action="store_true", help="Enrich duplicates with vendor/OUI (requires manuf)")
+    parser.add_argument("--snmp-switch", nargs="*", help="IP(s) of switch to poll FDB via SNMP (optional)")
+    parser.add_argument("--snmp-community", default="public", help="SNMP community string (default: public)")
+    parser.add_argument("--snmp-timeout", type=int, default=1, help="SNMP timeout (seconds)")
+    parser.add_argument("--output", help="Append JSON results to file")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
+
+    if args.enrich and not MANUF_AVAILABLE:
+        logger.warning("manuf (OUI lookup) not installed. Install with: pip install manuf")
+    if args.snmp_switch and not PYSNMP_AVAILABLE:
+        logger.warning("pysnmp not installed. Install with: pip install pysnmp")
+    if args.interval > 0:
+        logger.info("Running continuous mode every %d seconds. Ctrl-C to stop.", args.interval)
+
+    vendor_parser = vendor_lookup_init() if args.enrich else None
+
+    try:
+        while True:
+            run_once(args, vendor_parser)
+            if args.interval <= 0:
+                break
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user, exiting.")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    # must be run as root/with capabilities (scapy)
+    if not hasattr(conf, "route"):
+        # basic sanity, but scapy will raise if not privileged
+        pass
+    main()
+
